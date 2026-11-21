@@ -68,3 +68,14 @@ def _estimator(n_rows: int) -> Pipeline:
     folds = max(2, min(cv_folds, int(np.min(np.bincount(y))), len(statements)))
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
     oof = np.zeros(len(statements), dtype=np.float64)
+    for tr_idx, va_idx in skf.split(np.zeros(len(y)), y):
+        enc = FeatureEncoder(smoothing=10.0).fit([statements[i] for i in tr_idx], y[tr_idx].astype(float))
+        x_tr = build_feature_matrix([statements[i] for i in tr_idx], [signals[i] for i in tr_idx], enc)
+        x_va = build_feature_matrix([statements[i] for i in va_idx], [signals[i] for i in va_idx], enc)
+        clf = _estimator(len(tr_idx)).fit(x_tr, y[tr_idx])
+        oof[va_idx] = np.clip(clf.predict_proba(x_va)[:, 1], 0.0, 1.0)
+
+    auc = float(roc_auc_score(y, oof))
+    acc = float(accuracy_score(y, (oof >= 0.5).astype(int)))
+    ll = float(log_loss(y, np.clip(oof, 1e-6, 1.0 - 1e-6)))
+    print(f"Samples: {len(statements)} | Folds: {folds} | OOF ROC AUC: {auc:.4f} | Acc: {acc:.4f} | LogLoss: {ll:.4f}")
