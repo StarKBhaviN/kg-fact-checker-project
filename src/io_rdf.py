@@ -10,6 +10,8 @@ from typing import List, Optional, Sequence, Set
 from rdflib import Graph, Literal, Namespace, URIRef
 from rdflib.namespace import RDF, XSD
 
+from typing import Iterable
+
 SWC = Namespace("http://swc2017.aksw.org/")
 HAS_TRUTH_VALUE = SWC.hasTruthValue
 
@@ -97,3 +99,40 @@ def write_result_ttl(
         lines.append(f"{uri.n3()} <{HAS_TRUTH_VALUE}> {format_truth_score(float(raw_score))} .")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
+
+def validate_turtle_output(
+    ttl_path: str | Path,
+    expected_stmt_uris: Optional[Iterable[str]] = None,
+) -> dict:
+    """Validate Turtle syntax, non-empty output, URI coverage, and [0.0, 1.0] bounds."""
+    path = Path(ttl_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Turtle file not found: {path}")
+
+    graph = Graph()
+    graph.parse(str(path), format="turtle")
+
+    scores: dict[str, float] = {}
+    for s, _, o in graph.triples((None, HAS_TRUTH_VALUE, None)):
+        if not isinstance(s, URIRef) or not isinstance(o, Literal):
+            raise ValueError(f"Invalid truth triple: ({s!r}, {o!r})")
+        val = float(o.toPython())
+        if not math.isfinite(val) or not (0.0 <= val <= 1.0):
+            raise ValueError(f"Score out of [0.0, 1.0] for {s}: {val}")
+        scores[str(s)] = val
+
+    if not scores:
+        raise ValueError(f"No truth value triples found in {path}")
+
+    if expected_stmt_uris is not None:
+        expected = {str(u).strip() for u in expected_stmt_uris}
+        missing = sorted(expected - set(scores.keys()))
+        if missing:
+            raise ValueError(f"Missing {len(missing)} expected statement URIs: {missing[:5]}")
+
+    return {
+        "path": str(path),
+        "triple_count": len(scores),
+        "min_score": min(scores.values()),
+        "max_score": max(scores.values()),
+    }
