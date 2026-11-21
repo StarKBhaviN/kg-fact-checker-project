@@ -1,6 +1,6 @@
 # KG Fact-Checker (`kg-fact-checker`)
 
-Reproducible Knowledge Graph Fact-Checking pipeline for **FactBench** evaluated on **GERBIL** (`http://gerbil-kbc.aksw.org/gerbil/config`), targeting **ROC AUC > 0.60** before **January 15, 2027**.
+Reproducible Knowledge Graph Fact-Checking pipeline for **FactBench**.
 
 ## Setup (macOS / Linux)
 
