@@ -96,3 +96,18 @@ def _estimator(n_rows: int) -> Pipeline:
     )
     print(f"Saved model to {out_path}")
     return {"roc_auc": auc, "accuracy": acc, "log_loss": ll}
+    def main(argv: List[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Train KG Fact-Checking model.")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--model-out", default="models/fact_checker.joblib")
+    parser.add_argument("--cache-dir", default="cache")
+    parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument("--offline", action="store_true")
+    args = parser.parse_args(argv)
+    metrics = run_training(args.input, args.model_out, args.cache_dir, args.cv_folds, args.offline)
+    if metrics["roc_auc"] <= 0.60:
+        print(f"Warning: OOF ROC AUC ({metrics['roc_auc']:.4f}) is not yet above target 0.60.")
+
+
+if __name__ == "__main__":
+    main()
