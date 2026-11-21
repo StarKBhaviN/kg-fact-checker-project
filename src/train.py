@@ -79,3 +79,20 @@ def _estimator(n_rows: int) -> Pipeline:
     acc = float(accuracy_score(y, (oof >= 0.5).astype(int)))
     ll = float(log_loss(y, np.clip(oof, 1e-6, 1.0 - 1e-6)))
     print(f"Samples: {len(statements)} | Folds: {folds} | OOF ROC AUC: {auc:.4f} | Acc: {acc:.4f} | LogLoss: {ll:.4f}")
+    full_enc = FeatureEncoder(smoothing=10.0).fit(statements, y.astype(float))
+    x_full = build_feature_matrix(statements, signals, full_enc)
+    final_clf = _estimator(len(statements)).fit(x_full, y)
+
+    out_path = Path(model_out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": final_clf,
+            "encoder": full_enc,
+            "feature_columns": FEATURE_COLUMNS,
+            "cv_metrics": {"roc_auc": auc, "accuracy": acc, "log_loss": ll, "folds": folds},
+        },
+        out_path,
+    )
+    print(f"Saved model to {out_path}")
+    return {"roc_auc": auc, "accuracy": acc, "log_loss": ll}
