@@ -141,3 +141,80 @@ class DBpediaClient:
                     continue
                 break
         return None
+
+    @staticmethod
+    def _int_val(data: Optional[Dict[str, Any]], var: str) -> int:
+        if not data:
+            return 0
+        bindings = data.get("results", {}).get("bindings", [])
+        if not bindings:
+            return 0
+        try:
+            return max(0, int(float(bindings[0].get(var, {}).get("value", 0))))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _ask_val(data: Optional[Dict[str, Any]]) -> bool:
+        if not data:
+            return False
+        if "boolean" in data:
+            return bool(data["boolean"])
+        return len(data.get("results", {}).get("bindings", [])) > 0
+
+    def _query_match_and_degrees(
+        self, subject: str, predicate: str, obj: str
+    ) -> tuple[bool, bool, int, int, int, int, int, int, bool]:
+        s_uri, o_uri = self._is_uri(subject), self._is_uri(obj)
+        s_t, p_t, o_t = self._term(subject), self._term(predicate), self._term(obj)
+        responded = False
+
+        r_dir = self.query_json(f"ASK WHERE {{ {s_t} {p_t} {o_t} . }}")
+        responded = responded or (r_dir is not None)
+        direct_match = self._ask_val(r_dir)
+
+        inverse_match = False
+        if s_uri and o_uri:
+            r_inv = self.query_json(f"ASK WHERE {{ {o_t} {p_t} {s_t} . }}")
+            responded = responded or (r_inv is not None)
+            inverse_match = self._ask_val(r_inv)
+
+        subj_out = subj_in = pred_subj = 0
+        if s_uri:
+            r_s = self.query_json(
+                f"SELECT (COUNT(DISTINCT ?p1) AS ?outDeg) (COUNT(DISTINCT ?s2) AS ?inDeg) "
+                f"(COUNT(DISTINCT ?s3) AS ?pSubj) WHERE {{ "
+                f"{{ {s_t} ?p1 ?y1 . }} UNION {{ ?s2 ?p2 {s_t} . }} "
+                f"OPTIONAL {{ ?s3 {p_t} ?o3 . }} }}"
+            )
+            if r_s is not None:
+                responded = True
+                subj_out = self._int_val(r_s, "outDeg")
+                subj_in = self._int_val(r_s, "inDeg")
+                pred_subj = self._int_val(r_s, "pSubj")
+
+        obj_in = obj_out = pred_obj = 0
+        if o_uri:
+            r_o = self.query_json(
+                f"SELECT (COUNT(DISTINCT ?s1) AS ?inDeg) (COUNT(DISTINCT ?p2) AS ?outDeg) "
+                f"(COUNT(DISTINCT ?o3) AS ?pObj) WHERE {{ "
+                f"{{ ?s1 ?p1 {o_t} . }} UNION {{ {o_t} ?p2 ?y2 . }} "
+                f"OPTIONAL {{ ?s3 {p_t} ?o3 . }} }}"
+            )
+            if r_o is not None:
+                responded = True
+                obj_in = self._int_val(r_o, "inDeg")
+                obj_out = self._int_val(r_o, "outDeg")
+                pred_obj = self._int_val(r_o, "pObj")
+
+        return (
+            direct_match,
+            inverse_match,
+            subj_out,
+            subj_in,
+            obj_in,
+            obj_out,
+            pred_subj,
+            pred_obj,
+            responded,
+        )
