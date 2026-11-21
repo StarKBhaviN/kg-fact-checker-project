@@ -50,3 +50,21 @@ def _estimator(n_rows: int) -> Pipeline:
             ),
         ]
     )
+    def run_training(
+    input_path: str | Path,
+    model_out: str | Path = "models/fact_checker.joblib",
+    cache_dir: str | Path = "cache",
+    cv_folds: int = 5,
+    offline: bool = False,
+) -> dict:
+    statements = parse_nt_statements(input_path)
+    y = np.array([1 if (s.label is not None and s.label >= 0.5) else 0 for s in statements], dtype=np.int64)
+    if len(np.unique(y)) < 2:
+        raise ValueError("Training set must include both positive and negative truth labels.")
+
+    kg_client = None if offline else DBpediaClient(cache_dir=cache_dir)
+    signals = fetch_signals_batch(statements, kg_client)
+
+    folds = max(2, min(cv_folds, int(np.min(np.bincount(y))), len(statements)))
+    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+    oof = np.zeros(len(statements), dtype=np.float64)
