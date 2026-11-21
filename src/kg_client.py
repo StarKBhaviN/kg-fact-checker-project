@@ -218,3 +218,87 @@ class DBpediaClient:
             pred_obj,
             responded,
         )
+    
+    def _query_neighborhood_and_types(
+        self, subject: str, predicate: str, obj: str
+    ) -> tuple[int, int, bool, bool, bool, bool]:
+        s_uri, o_uri, p_uri = self._is_uri(subject), self._is_uri(obj), self._is_uri(predicate)
+        s_t, p_t, o_t = self._term(subject), self._term(predicate), self._term(obj)
+        responded = False
+
+        shared = two_hops = 0
+        if s_uri and o_uri and subject != obj:
+            r_sh = self.query_json(
+                f"SELECT (COUNT(DISTINCT ?mid) AS ?shared) WHERE {{ "
+                f"{{ {s_t} ?p1 ?mid . ?mid ?p2 {o_t} . }} "
+                f"UNION {{ {s_t} ?p3 ?mid . {o_t} ?p4 ?mid . }} "
+                f"UNION {{ ?mid ?p5 {s_t} . ?mid ?p6 {o_t} . }} }}"
+            )
+            if r_sh is not None:
+                responded = True
+                shared = self._int_val(r_sh, "shared")
+
+            r_2h = self.query_json(
+                f"SELECT (COUNT(*) AS ?hops) WHERE {{ "
+                f"{{ {s_t} ?p1 ?mid . ?mid {p_t} {o_t} . }} "
+                f"UNION {{ {s_t} {p_t} ?mid . ?mid ?p2 {o_t} . }} }} LIMIT 100"
+            )
+            if r_2h is not None:
+                responded = True
+                two_hops = self._int_val(r_2h, "hops")
+
+        s_types, o_types, expected_ranges = set(), set(), set()
+        if s_uri:
+            r_st = self.query_json(f"SELECT DISTINCT ?t WHERE {{ {s_t} a ?t . }} LIMIT 25")
+            if r_st is not None:
+                responded = True
+                s_types = {b["t"]["value"] for b in r_st.get("results", {}).get("bindings", []) if "t" in b}
+        if o_uri:
+            r_ot = self.query_json(f"SELECT DISTINCT ?t WHERE {{ {o_t} a ?t . }} LIMIT 25")
+            if r_ot is not None:
+                responded = True
+                o_types = {b["t"]["value"] for b in r_ot.get("results", {}).get("bindings", []) if "t" in b}
+        if p_uri:
+            r_rg = self.query_json(
+                f"SELECT DISTINCT ?rg WHERE {{ {p_t} <http://www.w3.org/2000/01/rdf-schema#range> ?rg . }} LIMIT 20"
+            )
+            if r_rg is not None:
+                responded = True
+                expected_ranges = {b["rg"]["value"] for b in r_rg.get("results", {}).get("bindings", []) if "rg" in b}
+
+        type_compat = (
+            bool(expected_ranges & o_types) if (expected_ranges and o_types) else bool(s_types and o_types)
+        )
+        return shared, two_hops, bool(s_types), bool(o_types), type_compat, responded
+
+    def get_triple_signals(self, subject: str, predicate: str, obj: str) -> KGSignals:
+        """Assemble cached KG signals for a candidate (subject, predicate, object) triple."""
+        key = f"signals::{subject}||{predicate}||{obj}"
+        cached = self.cache.get(self.endpoint, key)
+        if cached is not None:
+            return KGSignals(**cached)
+
+        direct_match, inverse_match, subj_out, subj_in, obj_in, obj_out, pred_subj, pred_obj, ok_a = (
+            self._query_match_and_degrees(subject, predicate, obj)
+        )
+        shared, two_hops, has_s_t, has_o_t, type_compat, ok_b = self._query_neighborhood_and_types(
+            subject, predicate, obj
+        )
+        signals = KGSignals(
+            direct_match=direct_match,
+            inverse_match=inverse_match,
+            subject_out_degree=subj_out,
+            subject_in_degree=subj_in,
+            object_in_degree=obj_in,
+            object_out_degree=obj_out,
+            shared_neighbors_count=shared,
+            two_hop_paths_count=two_hops,
+            predicate_subject_count=pred_subj,
+            predicate_object_count=pred_obj,
+            subject_has_types=has_s_t,
+            object_has_types=has_o_t,
+            type_compatible=type_compat,
+            offline_or_empty=not (ok_a or ok_b),
+        )
+        self.cache.put(self.endpoint, key, signals.__dict__)
+        return signals
