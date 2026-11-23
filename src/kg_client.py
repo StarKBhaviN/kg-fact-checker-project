@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Set
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -44,6 +44,7 @@ class SPARQLCache:
         with self._lock:
             conn = sqlite3.connect(str(self.db_path), timeout=30.0)
             try:
+                conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS sparql_cache ("
                     "k TEXT PRIMARY KEY, payload TEXT NOT NULL, ts REAL NOT NULL)"
@@ -87,9 +88,9 @@ class DBpediaClient:
         self,
         endpoint: str = DEFAULT_ENDPOINT,
         cache_dir: str | Path = "cache",
-        timeout: float = 12.0,
-        max_retries: int = 3,
-        backoff_base: float = 1.0,
+        timeout: float = 6.0,
+        max_retries: int = 1,
+        backoff_base: float = 0.5,
     ) -> None:
         self.endpoint = endpoint
         self.cache = SPARQLCache(Path(cache_dir) / "sparql_cache.sqlite")
@@ -110,11 +111,12 @@ class DBpediaClient:
         escaped = t.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
 
-    def query_json(self, sparql: str) -> Optional[Dict[str, Any]]:
+    def query_json(self, sparql: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         cached = self.cache.get(self.endpoint, sparql)
         if cached is not None:
             return cached
 
+        req_timeout = timeout if timeout is not None else self.timeout
         url = f"{self.endpoint}?{urlencode({'query': sparql, 'format': 'application/sparql-results+json'})}"
         for attempt in range(self.max_retries + 1):
             req = Request(
@@ -125,20 +127,17 @@ class DBpediaClient:
                 },
             )
             try:
-                with urlopen(req, timeout=self.timeout) as resp:
+                with urlopen(req, timeout=req_timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     if isinstance(data, dict):
                         self.cache.put(self.endpoint, sparql, data)
                         return data
             except HTTPError as exc:
-                if exc.code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                if exc.code == 429 and attempt < self.max_retries:
                     time.sleep(self.backoff_base * (2**attempt))
                     continue
                 break
             except (URLError, TimeoutError, OSError, json.JSONDecodeError):
-                if attempt < self.max_retries:
-                    time.sleep(self.backoff_base * (2**attempt))
-                    continue
                 break
         return None
 
@@ -162,114 +161,80 @@ class DBpediaClient:
             return bool(data["boolean"])
         return len(data.get("results", {}).get("bindings", [])) > 0
 
-    def _query_match_and_degrees(
-        self, subject: str, predicate: str, obj: str
-    ) -> tuple[bool, bool, int, int, int, int, int, int, bool]:
-        s_uri, o_uri = self._is_uri(subject), self._is_uri(obj)
-        s_t, p_t, o_t = self._term(subject), self._term(predicate), self._term(obj)
-        responded = False
-
-        r_dir = self.query_json(f"ASK WHERE {{ {s_t} {p_t} {o_t} . }}")
-        responded = responded or (r_dir is not None)
-        direct_match = self._ask_val(r_dir)
-
-        inverse_match = False
-        if s_uri and o_uri:
-            r_inv = self.query_json(f"ASK WHERE {{ {o_t} {p_t} {s_t} . }}")
-            responded = responded or (r_inv is not None)
-            inverse_match = self._ask_val(r_inv)
-
-        subj_out = subj_in = pred_subj = 0
-        if s_uri:
-            r_s = self.query_json(
-                f"SELECT (COUNT(DISTINCT ?p1) AS ?outDeg) (COUNT(DISTINCT ?s2) AS ?inDeg) "
-                f"(COUNT(DISTINCT ?s3) AS ?pSubj) WHERE {{ "
-                f"{{ {s_t} ?p1 ?y1 . }} UNION {{ ?s2 ?p2 {s_t} . }} "
-                f"OPTIONAL {{ ?s3 {p_t} ?o3 . }} }}"
-            )
-            if r_s is not None:
-                responded = True
-                subj_out = self._int_val(r_s, "outDeg")
-                subj_in = self._int_val(r_s, "inDeg")
-                pred_subj = self._int_val(r_s, "pSubj")
-
-        obj_in = obj_out = pred_obj = 0
-        if o_uri:
-            r_o = self.query_json(
-                f"SELECT (COUNT(DISTINCT ?s1) AS ?inDeg) (COUNT(DISTINCT ?p2) AS ?outDeg) "
-                f"(COUNT(DISTINCT ?o3) AS ?pObj) WHERE {{ "
-                f"{{ ?s1 ?p1 {o_t} . }} UNION {{ {o_t} ?p2 ?y2 . }} "
-                f"OPTIONAL {{ ?s3 {p_t} ?o3 . }} }}"
-            )
-            if r_o is not None:
-                responded = True
-                obj_in = self._int_val(r_o, "inDeg")
-                obj_out = self._int_val(r_o, "outDeg")
-                pred_obj = self._int_val(r_o, "pObj")
-
-        return (
-            direct_match,
-            inverse_match,
-            subj_out,
-            subj_in,
-            obj_in,
-            obj_out,
-            pred_subj,
-            pred_obj,
-            responded,
+    def get_entity_degrees(self, entity: str) -> Tuple[int, int]:
+        if not self._is_uri(entity):
+            return 0, 0
+        k = f"entity_deg::{entity}"
+        cached = self.cache.get(self.endpoint, k)
+        if cached is not None:
+            return cached.get("out", 0), cached.get("in", 0)
+        e_t = self._term(entity)
+        r = self.query_json(
+            f"SELECT (COUNT(DISTINCT ?p) AS ?outDeg) (COUNT(DISTINCT ?s) AS ?inDeg) WHERE {{ "
+            f"{{ {e_t} ?p ?o . }} UNION {{ ?s ?p2 {e_t} . }} }}",
+            timeout=5.0,
         )
-    
-    def _query_neighborhood_and_types(
-        self, subject: str, predicate: str, obj: str
-    ) -> tuple[int, int, bool, bool, bool, bool]:
-        s_uri, o_uri, p_uri = self._is_uri(subject), self._is_uri(obj), self._is_uri(predicate)
-        s_t, p_t, o_t = self._term(subject), self._term(predicate), self._term(obj)
-        responded = False
+        out_deg = self._int_val(r, "outDeg") if r else 0
+        in_deg = self._int_val(r, "inDeg") if r else 0
+        self.cache.put(self.endpoint, k, {"out": out_deg, "in": in_deg})
+        return out_deg, in_deg
 
-        shared = two_hops = 0
-        if s_uri and o_uri and subject != obj:
-            r_sh = self.query_json(
-                f"SELECT (COUNT(DISTINCT ?mid) AS ?shared) WHERE {{ "
-                f"{{ {s_t} ?p1 ?mid . ?mid ?p2 {o_t} . }} "
-                f"UNION {{ {s_t} ?p3 ?mid . {o_t} ?p4 ?mid . }} "
-                f"UNION {{ ?mid ?p5 {s_t} . ?mid ?p6 {o_t} . }} }}"
-            )
-            if r_sh is not None:
-                responded = True
-                shared = self._int_val(r_sh, "shared")
-
-            r_2h = self.query_json(
-                f"SELECT (COUNT(*) AS ?hops) WHERE {{ "
-                f"{{ {s_t} ?p1 ?mid . ?mid {p_t} {o_t} . }} "
-                f"UNION {{ {s_t} {p_t} ?mid . ?mid ?p2 {o_t} . }} }} LIMIT 100"
-            )
-            if r_2h is not None:
-                responded = True
-                two_hops = self._int_val(r_2h, "hops")
-
-        s_types, o_types, expected_ranges = set(), set(), set()
-        if s_uri:
-            r_st = self.query_json(f"SELECT DISTINCT ?t WHERE {{ {s_t} a ?t . }} LIMIT 25")
-            if r_st is not None:
-                responded = True
-                s_types = {b["t"]["value"] for b in r_st.get("results", {}).get("bindings", []) if "t" in b}
-        if o_uri:
-            r_ot = self.query_json(f"SELECT DISTINCT ?t WHERE {{ {o_t} a ?t . }} LIMIT 25")
-            if r_ot is not None:
-                responded = True
-                o_types = {b["t"]["value"] for b in r_ot.get("results", {}).get("bindings", []) if "t" in b}
-        if p_uri:
-            r_rg = self.query_json(
-                f"SELECT DISTINCT ?rg WHERE {{ {p_t} <http://www.w3.org/2000/01/rdf-schema#range> ?rg . }} LIMIT 20"
-            )
-            if r_rg is not None:
-                responded = True
-                expected_ranges = {b["rg"]["value"] for b in r_rg.get("results", {}).get("bindings", []) if "rg" in b}
-
-        type_compat = (
-            bool(expected_ranges & o_types) if (expected_ranges and o_types) else bool(s_types and o_types)
+    def get_predicate_counts(self, predicate: str) -> Tuple[int, int]:
+        if not self._is_uri(predicate):
+            return 0, 0
+        k = f"pred_counts::{predicate}"
+        cached = self.cache.get(self.endpoint, k)
+        if cached is not None:
+            return cached.get("subj", 0), cached.get("obj", 0)
+        p_t = self._term(predicate)
+        r = self.query_json(
+            f"SELECT (COUNT(DISTINCT ?s) AS ?pSubj) (COUNT(DISTINCT ?o) AS ?pObj) WHERE {{ ?s {p_t} ?o . }}",
+            timeout=5.0,
         )
-        return shared, two_hops, bool(s_types), bool(o_types), type_compat, responded
+        p_s = self._int_val(r, "pSubj") if r else 0
+        p_o = self._int_val(r, "pObj") if r else 0
+        self.cache.put(self.endpoint, k, {"subj": p_s, "obj": p_o})
+        return p_s, p_o
+
+    def get_predicate_ranges(self, predicate: str) -> Set[str]:
+        if not self._is_uri(predicate):
+            return set()
+        k = f"pred_range::{predicate}"
+        cached = self.cache.get(self.endpoint, k)
+        if cached is not None:
+            return set(cached.get("ranges", []))
+        p_t = self._term(predicate)
+        r = self.query_json(
+            f"SELECT DISTINCT ?rg WHERE {{ {p_t} <http://www.w3.org/2000/01/rdf-schema#range> ?rg . }} LIMIT 20",
+            timeout=4.0,
+        )
+        ranges = (
+            [b["rg"]["value"] for b in r.get("results", {}).get("bindings", []) if "rg" in b]
+            if r
+            else []
+        )
+        self.cache.put(self.endpoint, k, {"ranges": ranges})
+        return set(ranges)
+
+    def get_entity_types(self, entity: str) -> Set[str]:
+        if not self._is_uri(entity):
+            return set()
+        k = f"entity_types::{entity}"
+        cached = self.cache.get(self.endpoint, k)
+        if cached is not None:
+            return set(cached.get("types", []))
+        e_t = self._term(entity)
+        r = self.query_json(
+            f"SELECT DISTINCT ?t WHERE {{ {e_t} a ?t . }} LIMIT 25",
+            timeout=4.0,
+        )
+        types = (
+            [b["t"]["value"] for b in r.get("results", {}).get("bindings", []) if "t" in b]
+            if r
+            else []
+        )
+        self.cache.put(self.endpoint, k, {"types": types})
+        return set(types)
 
     def get_triple_signals(self, subject: str, predicate: str, obj: str) -> KGSignals:
         """Assemble cached KG signals for a candidate (subject, predicate, object) triple."""
@@ -278,12 +243,64 @@ class DBpediaClient:
         if cached is not None:
             return KGSignals(**cached)
 
-        direct_match, inverse_match, subj_out, subj_in, obj_in, obj_out, pred_subj, pred_obj, ok_a = (
-            self._query_match_and_degrees(subject, predicate, obj)
+        s_uri = self._is_uri(subject)
+        o_uri = self._is_uri(obj)
+        p_uri = self._is_uri(predicate)
+        s_t = self._term(subject)
+        p_t = self._term(predicate)
+        o_t = self._term(obj)
+        responded = False
+
+        # 1. Direct match ASK
+        r_dir = self.query_json(f"ASK WHERE {{ {s_t} {p_t} {o_t} . }}", timeout=5.0)
+        responded = responded or (r_dir is not None)
+        direct_match = self._ask_val(r_dir)
+
+        # 2. Inverse match ASK
+        inverse_match = False
+        if s_uri and o_uri:
+            r_inv = self.query_json(f"ASK WHERE {{ {o_t} {p_t} {s_t} . }}", timeout=5.0)
+            responded = responded or (r_inv is not None)
+            inverse_match = self._ask_val(r_inv)
+
+        # 3. Entity degrees & Predicate counts (cached by entity / predicate)
+        subj_out, subj_in = self.get_entity_degrees(subject) if s_uri else (0, 0)
+        obj_in, obj_out = self.get_entity_degrees(obj) if o_uri else (0, 0)
+        pred_subj, pred_obj = self.get_predicate_counts(predicate) if p_uri else (0, 0)
+
+        # 4. Shared neighbors & 2-hop paths (only if not identical and both URIs)
+        shared = two_hops = 0
+        if s_uri and o_uri and subject != obj:
+            r_2h = self.query_json(
+                f"SELECT (COUNT(*) AS ?hops) WHERE {{ "
+                f"{{ {s_t} ?p1 ?mid . ?mid {p_t} {o_t} . }} "
+                f"UNION {{ {s_t} {p_t} ?mid . ?mid ?p2 {o_t} . }} }} LIMIT 50",
+                timeout=5.0,
+            )
+            if r_2h is not None:
+                responded = True
+                two_hops = self._int_val(r_2h, "hops")
+
+            r_sh = self.query_json(
+                f"SELECT (COUNT(DISTINCT ?mid) AS ?shared) WHERE {{ "
+                f"{{ {s_t} ?p1 ?mid . ?mid ?p2 {o_t} . }} "
+                f"UNION {{ {s_t} ?p3 ?mid . {o_t} ?p4 ?mid . }} }} LIMIT 50",
+                timeout=5.0,
+            )
+            if r_sh is not None:
+                responded = True
+                shared = self._int_val(r_sh, "shared")
+
+        # 5. Types & Type compatibility (cached by entity / predicate)
+        s_types = self.get_entity_types(subject) if s_uri else set()
+        o_types = self.get_entity_types(obj) if o_uri else set()
+        expected_ranges = self.get_predicate_ranges(predicate) if p_uri else set()
+        type_compat = (
+            bool(expected_ranges & o_types)
+            if (expected_ranges and o_types)
+            else bool(s_types and o_types)
         )
-        shared, two_hops, has_s_t, has_o_t, type_compat, ok_b = self._query_neighborhood_and_types(
-            subject, predicate, obj
-        )
+
         signals = KGSignals(
             direct_match=direct_match,
             inverse_match=inverse_match,
@@ -295,10 +312,10 @@ class DBpediaClient:
             two_hop_paths_count=two_hops,
             predicate_subject_count=pred_subj,
             predicate_object_count=pred_obj,
-            subject_has_types=has_s_t,
-            object_has_types=has_o_t,
+            subject_has_types=bool(s_types),
+            object_has_types=bool(o_types),
             type_compatible=type_compat,
-            offline_or_empty=not (ok_a or ok_b),
+            offline_or_empty=not (responded or direct_match or inverse_match or subj_out > 0 or obj_in > 0),
         )
         self.cache.put(self.endpoint, key, signals.__dict__)
         return signals

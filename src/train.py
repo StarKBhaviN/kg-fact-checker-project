@@ -41,21 +41,25 @@ def _estimator(n_rows: int) -> Pipeline:
             (
                 "clf",
                 HistGradientBoostingClassifier(
-                    max_iter=120,
-                    learning_rate=0.06,
-                    max_depth=4,
-                    min_samples_leaf=5,
+                    max_iter=45,
+                    learning_rate=0.03,
+                    max_depth=2,
+                    min_samples_leaf=15,
+                    l2_regularization=1.0,
                     random_state=42,
                 ),
             ),
         ]
     )
-    def run_training(
+
+
+def run_training(
     input_path: str | Path,
     model_out: str | Path = "models/fact_checker.joblib",
     cache_dir: str | Path = "cache",
     cv_folds: int = 5,
     offline: bool = False,
+    workers: int = 8,
 ) -> dict:
     statements = parse_nt_statements(input_path)
     y = np.array([1 if (s.label is not None and s.label >= 0.5) else 0 for s in statements], dtype=np.int64)
@@ -63,7 +67,7 @@ def _estimator(n_rows: int) -> Pipeline:
         raise ValueError("Training set must include both positive and negative truth labels.")
 
     kg_client = None if offline else DBpediaClient(cache_dir=cache_dir)
-    signals = fetch_signals_batch(statements, kg_client)
+    signals = fetch_signals_batch(statements, kg_client, max_workers=workers)
 
     folds = max(2, min(cv_folds, int(np.min(np.bincount(y))), len(statements)))
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
@@ -96,15 +100,25 @@ def _estimator(n_rows: int) -> Pipeline:
     )
     print(f"Saved model to {out_path}")
     return {"roc_auc": auc, "accuracy": acc, "log_loss": ll}
-    def main(argv: List[str] | None = None) -> None:
+
+
+def main(argv: List[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train KG Fact-Checking model.")
     parser.add_argument("--input", required=True)
     parser.add_argument("--model-out", default="models/fact_checker.joblib")
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args(argv)
-    metrics = run_training(args.input, args.model_out, args.cache_dir, args.cv_folds, args.offline)
+    metrics = run_training(
+        args.input,
+        args.model_out,
+        args.cache_dir,
+        args.cv_folds,
+        args.offline,
+        workers=args.workers,
+    )
     if metrics["roc_auc"] <= 0.60:
         print(f"Warning: OOF ROC AUC ({metrics['roc_auc']:.4f}) is not yet above target 0.60.")
 
