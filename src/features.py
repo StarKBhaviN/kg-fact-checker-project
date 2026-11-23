@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -21,6 +22,9 @@ FEATURE_COLUMNS: List[str] = [
     "log1p_obj_out_deg",
     "log1p_shared_neighbors",
     "log1p_two_hop_paths",
+    "has_2hop",
+    "has_shared",
+    "direct_or_2hop",
     "log1p_pred_subj_cnt",
     "log1p_pred_obj_cnt",
     "subj_has_types",
@@ -75,8 +79,11 @@ class FeatureEncoder:
         denom = max(1, self.total_rows)
         p_cnt = self.pred_counts.get(stmt.predicate, 0)
         p_sum = self.pred_sums.get(stmt.predicate, 0.0)
+        dm = 1.0 if sig.direct_match else 0.0
+        h2 = 1.0 if sig.two_hop_paths_count > 0 else 0.0
+        hs = 1.0 if sig.shared_neighbors_count > 0 else 0.0
         return {
-            "direct_match": 1.0 if sig.direct_match else 0.0,
+            "direct_match": dm,
             "inverse_match": 1.0 if sig.inverse_match else 0.0,
             "log1p_subj_out_deg": _log1p(sig.subject_out_degree),
             "log1p_subj_in_deg": _log1p(sig.subject_in_degree),
@@ -84,6 +91,9 @@ class FeatureEncoder:
             "log1p_obj_out_deg": _log1p(sig.object_out_degree),
             "log1p_shared_neighbors": _log1p(sig.shared_neighbors_count),
             "log1p_two_hop_paths": _log1p(sig.two_hop_paths_count),
+            "has_2hop": h2,
+            "has_shared": hs,
+            "direct_or_2hop": 1.0 if (dm > 0 or h2 > 0) else 0.0,
             "log1p_pred_subj_cnt": _log1p(sig.predicate_subject_count),
             "log1p_pred_obj_cnt": _log1p(sig.predicate_object_count),
             "subj_has_types": 1.0 if sig.subject_has_types else 0.0,
@@ -103,16 +113,43 @@ class FeatureEncoder:
 def fetch_signals_batch(
     statements: Sequence[FactStatement],
     kg_client: Optional[DBpediaClient],
+    max_workers: int = 8,
 ) -> List[KGSignals]:
-    if kg_client is None:
+    if kg_client is None or len(statements) == 0:
         return [KGSignals(offline_or_empty=True) for _ in statements]
-    out: List[KGSignals] = []
-    for stmt in statements:
+
+    total = len(statements)
+    print(f"Fetching KG signals for {total} statements (concurrency={max_workers})...")
+
+    # Pre-fetch predicate metadata first (ranges and counts) for the distinct predicates
+    unique_preds = {s.predicate for s in statements if _is_uri(s.predicate)}
+    for p in unique_preds:
         try:
-            out.append(kg_client.get_triple_signals(stmt.subject, stmt.predicate, stmt.object))
+            kg_client.get_predicate_ranges(p)
+            kg_client.get_predicate_counts(p)
         except Exception:
-            out.append(KGSignals(offline_or_empty=True))
-    return out
+            pass
+
+    results: List[Optional[KGSignals]] = [None] * total
+
+    def _worker(idx: int, stmt: FactStatement) -> tuple[int, KGSignals]:
+        try:
+            sig = kg_client.get_triple_signals(stmt.subject, stmt.predicate, stmt.object)
+        except Exception:
+            sig = KGSignals(offline_or_empty=True)
+        return idx, sig
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_worker, i, stmt) for i, stmt in enumerate(statements)]
+        for fut in as_completed(futures):
+            idx, sig = fut.result()
+            results[idx] = sig
+            completed += 1
+            if completed % 25 == 0 or completed == total:
+                print(f"  [KG signals] {completed}/{total} ({completed / total * 100:.1f}%) processed")
+
+    return [sig if sig is not None else KGSignals(offline_or_empty=True) for sig in results]
 
 
 def build_feature_matrix(

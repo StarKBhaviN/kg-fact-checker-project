@@ -20,6 +20,7 @@ def run_prediction(
     output_path: str | Path = "outputs/result.ttl",
     cache_dir: str | Path = "cache",
     offline: bool = False,
+    workers: int = 8,
 ) -> Path:
     statements = parse_nt_statements(input_path)
     artifact = joblib.load(model_in)
@@ -28,7 +29,7 @@ def run_prediction(
     cols = artifact.get("feature_columns", FEATURE_COLUMNS)
 
     kg_client = None if offline else DBpediaClient(cache_dir=cache_dir)
-    signals = fetch_signals_batch(statements, kg_client)
+    signals = fetch_signals_batch(statements, kg_client, max_workers=workers)
     x_test = build_feature_matrix(statements, signals, encoder).reindex(
         columns=cols, fill_value=0.0
     )
@@ -58,9 +59,17 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--model-in", default="models/fact_checker.joblib")
     parser.add_argument("--output", default="outputs/result.ttl")
     parser.add_argument("--cache-dir", default="cache")
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args(argv)
-    run_prediction(args.input, args.model_in, args.output, args.cache_dir, args.offline)
+    run_prediction(
+        args.input,
+        args.model_in,
+        args.output,
+        args.cache_dir,
+        args.offline,
+        workers=args.workers,
+    )
 
 
 if __name__ == "__main__":
