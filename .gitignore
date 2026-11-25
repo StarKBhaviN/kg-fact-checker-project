@@ -5,10 +5,10 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 cache/
-data/
-*.nt
-*.ttl
-*.joblib
+# data/
+# *.nt
+# *.ttl
+# *.joblib
 !models/.gitkeep
 !outputs/.gitkeep
 .env

@@ -8,7 +8,11 @@ from typing import List
 
 import joblib
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    VotingClassifier,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
@@ -25,8 +29,7 @@ from src.features import (
 from src.io_rdf import parse_nt_statements
 from src.kg_client import DBpediaClient
 
-
-def _estimator(n_rows: int) -> Pipeline:
+def _estimator(n_rows: int):
     if n_rows < 30:
         return Pipeline(
             [
@@ -35,23 +38,32 @@ def _estimator(n_rows: int) -> Pipeline:
                 ("clf", LogisticRegression(C=1.0, max_iter=1000, random_state=42)),
             ]
         )
-    return Pipeline(
+    c1 = HistGradientBoostingClassifier(
+        max_iter=100,
+        learning_rate=0.04,
+        max_depth=4,
+        min_samples_leaf=6,
+        l2_regularization=0.3,
+        random_state=42,
+    )
+    c2 = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=6,
+        min_samples_leaf=3,
+        random_state=42,
+    )
+    c3 = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-            (
-                "clf",
-                HistGradientBoostingClassifier(
-                    max_iter=45,
-                    learning_rate=0.03,
-                    max_depth=2,
-                    min_samples_leaf=15,
-                    l2_regularization=1.0,
-                    random_state=42,
-                ),
-            ),
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(C=0.8, max_iter=1000, random_state=42)),
         ]
     )
-
+    return VotingClassifier(
+        estimators=[("hgb", c1), ("rf", c2), ("lr", c3)],
+        voting="soft",
+        weights=[2.0, 1.5, 1.0],
+    )
 
 def run_training(
     input_path: str | Path,
@@ -60,6 +72,7 @@ def run_training(
     cv_folds: int = 5,
     offline: bool = False,
     workers: int = 8,
+    refresh_signals: bool = False,
 ) -> dict:
     statements = parse_nt_statements(input_path)
     y = np.array([1 if (s.label is not None and s.label >= 0.5) else 0 for s in statements], dtype=np.int64)
@@ -67,7 +80,9 @@ def run_training(
         raise ValueError("Training set must include both positive and negative truth labels.")
 
     kg_client = None if offline else DBpediaClient(cache_dir=cache_dir)
-    signals = fetch_signals_batch(statements, kg_client, max_workers=workers)
+    signals = fetch_signals_batch(
+        statements, kg_client, max_workers=workers, refresh=refresh_signals
+    )
 
     folds = max(2, min(cv_folds, int(np.min(np.bincount(y))), len(statements)))
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
@@ -109,6 +124,7 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--refresh-signals", action="store_true")
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args(argv)
     metrics = run_training(
@@ -118,10 +134,10 @@ def main(argv: List[str] | None = None) -> None:
         args.cv_folds,
         args.offline,
         workers=args.workers,
+        refresh_signals=args.refresh_signals,
     )
     if metrics["roc_auc"] <= 0.60:
         print(f"Warning: OOF ROC AUC ({metrics['roc_auc']:.4f}) is not yet above target 0.60.")
-
 
 if __name__ == "__main__":
     main()
