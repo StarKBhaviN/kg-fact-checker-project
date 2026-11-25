@@ -121,3 +121,23 @@ python -m pytest
    - Computes fold-local smoothed target statistics inside each CV fold to prevent data leakage.
 4. **Model Training & Inference (`src/train.py`, `src/predict.py`)**:
    - Evaluates a `HistGradientBoostingClassifier` pipeline using 5-fold Stratified Cross-Validation, then fits on the full training set and serializes the model + encoder via `joblib`.
+
+---
+
+## Project Structure & File Purposes
+
+| File / Directory | Purpose |
+| :--- | :--- |
+| `src/__init__.py` | Marks `src` as a Python package so modules can be run with `python -m src.<module>`. |
+| `src/io_rdf.py` | Handles RDF I/O: parses reified `.nt` fact statements into `FactStatement` objects, writes GERBIL-compatible `.ttl` predictions, and validates syntax, URI coverage, and `[0.0, 1.0]` score bounds. |
+| `src/kg_client.py` | Implements `SPARQLCache` (SQLite-backed thread-safe cache) and `DBpediaClient` to query DBpedia with retry/backoff logic and extract `KGSignals` without caching failed timeouts. |
+| `src/features.py` | Defines `FEATURE_COLUMNS`, `FeatureEncoder` (fold-local target/frequency encoding), `fetch_signals_batch` (multi-threaded KG signal fetching), and `build_feature_matrix` to construct leak-free feature matrices. |
+| `src/train.py` | CLI entry point for training: runs 5-fold Stratified CV, logs ROC AUC / Accuracy / LogLoss, trains the final `HistGradientBoostingClassifier` pipeline, and saves the model artifact. |
+| `src/predict.py` | CLI entry point for inference: loads the saved model artifact, extracts features for input statements, predicts truth probabilities, and writes/validates the output `.ttl` file. |
+| `tests/test_io_rdf.py` | Unit tests for `.nt` parsing, `.ttl` serialization, missing URI detection, and score range validation. |
+| `tests/test_features.py` | Unit tests for `SPARQLCache`, offline signal fetching, `FeatureEncoder`, and feature matrix construction. |
+| `requirements.txt` | Lists exact Python package dependencies (`rdflib`, `SPARQLWrapper`, `numpy`, `pandas`, `scikit-learn`, `joblib`, `pytest`). |
+| `data/` | Contains the FactBench N-Triples datasets (`FoKG26-train.nt` with ground-truth labels and `FoKG26-test.nt` for evaluation). |
+| `cache/` | Stores `sparql_cache.sqlite` so repeated training and prediction runs load DBpedia responses locally in seconds. |
+| `models/` | Stores the serialized model artifact (`fact_checker.joblib`) produced by `src.train`. |
+| `outputs/` | Stores the generated GERBIL Turtle prediction files (`result.ttl`, `result_train.ttl`). |
