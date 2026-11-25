@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -14,8 +16,17 @@ from src.io_rdf import FactStatement
 from src.kg_client import DBpediaClient, KGSignals
 
 FEATURE_COLUMNS: List[str] = [
+    "has_target_relation",
+    "has_conflicting_relation",
+    "has_other_relation",
     "direct_match",
+    "property_match",
+    "redirect_match",
+    "any_direct_match",
     "inverse_match",
+    "fwd_rel_count",
+    "rev_rel_count",
+    "verified_true_signal",
     "log1p_subj_out_deg",
     "log1p_subj_in_deg",
     "log1p_obj_in_deg",
@@ -25,6 +36,9 @@ FEATURE_COLUMNS: List[str] = [
     "has_2hop",
     "has_shared",
     "direct_or_2hop",
+    "token_jaccard",
+    "graph_jaccard",
+    "connectivity_composite",
     "log1p_pred_subj_cnt",
     "log1p_pred_obj_cnt",
     "subj_has_types",
@@ -79,21 +93,59 @@ class FeatureEncoder:
         denom = max(1, self.total_rows)
         p_cnt = self.pred_counts.get(stmt.predicate, 0)
         p_sum = self.pred_sums.get(stmt.predicate, 0.0)
-        dm = 1.0 if sig.direct_match else 0.0
+
+        target_rel = 1.0 if getattr(sig, "has_target_relation", False) else 0.0
+        conflict_rel = 1.0 if getattr(sig, "has_conflicting_relation", False) else 0.0
+        other_rel = 1.0 if getattr(sig, "has_other_relation", False) else 0.0
+        fwd_cnt = float(getattr(sig, "fwd_rel_count", 0))
+        rev_cnt = float(getattr(sig, "rev_rel_count", 0))
+
+        dm = 1.0 if getattr(sig, "direct_match", False) else 0.0
+        pm = 1.0 if getattr(sig, "property_match", False) else 0.0
+        rm = 1.0 if getattr(sig, "redirect_match", False) else 0.0
+        any_dm = 1.0 if (target_rel > 0 or dm > 0 or pm > 0 or rm > 0) else 0.0
         h2 = 1.0 if sig.two_hop_paths_count > 0 else 0.0
         hs = 1.0 if sig.shared_neighbors_count > 0 else 0.0
+
+        # Text token overlap between subject and object URIs
+        s_tokens = set(unquote(stmt.subject.split("/")[-1]).replace("_", " ").lower().split())
+        o_tokens = set(unquote(stmt.object.split("/")[-1]).replace("_", " ").lower().split())
+        token_jacc = len(s_tokens & o_tokens) / max(1, len(s_tokens | o_tokens))
+
+        # Normalized graph Jaccard similarity
+        subj_deg = _log1p(sig.subject_out_degree)
+        obj_deg = _log1p(sig.object_in_degree)
+        deg_sum = subj_deg + obj_deg
+        graph_jacc = _log1p(sig.shared_neighbors_count) / (deg_sum + 1.0)
+        conn_composite = 3.0 * any_dm + 1.5 * h2 + 0.5 * hs
+
+        # Verified composite signal: rewards matching target relation, strongly penalizes FactBench conflict corruptions
+        verified_sig = 2.0 * target_rel + 1.0 * any_dm - 2.5 * conflict_rel
+
         return {
+            "has_target_relation": target_rel,
+            "has_conflicting_relation": conflict_rel,
+            "has_other_relation": other_rel,
             "direct_match": dm,
+            "property_match": pm,
+            "redirect_match": rm,
+            "any_direct_match": any_dm,
             "inverse_match": 1.0 if sig.inverse_match else 0.0,
-            "log1p_subj_out_deg": _log1p(sig.subject_out_degree),
+            "fwd_rel_count": fwd_cnt,
+            "rev_rel_count": rev_cnt,
+            "verified_true_signal": verified_sig,
+            "log1p_subj_out_deg": subj_deg,
             "log1p_subj_in_deg": _log1p(sig.subject_in_degree),
-            "log1p_obj_in_deg": _log1p(sig.object_in_degree),
+            "log1p_obj_in_deg": obj_deg,
             "log1p_obj_out_deg": _log1p(sig.object_out_degree),
             "log1p_shared_neighbors": _log1p(sig.shared_neighbors_count),
             "log1p_two_hop_paths": _log1p(sig.two_hop_paths_count),
             "has_2hop": h2,
             "has_shared": hs,
             "direct_or_2hop": 1.0 if (dm > 0 or h2 > 0) else 0.0,
+            "token_jaccard": token_jacc,
+            "graph_jaccard": graph_jacc,
+            "connectivity_composite": conn_composite,
             "log1p_pred_subj_cnt": _log1p(sig.predicate_subject_count),
             "log1p_pred_obj_cnt": _log1p(sig.predicate_object_count),
             "subj_has_types": 1.0 if sig.subject_has_types else 0.0,
@@ -113,13 +165,14 @@ class FeatureEncoder:
 def fetch_signals_batch(
     statements: Sequence[FactStatement],
     kg_client: Optional[DBpediaClient],
-    max_workers: int = 8,
+    max_workers: int = 4,
+    refresh: bool = False,
 ) -> List[KGSignals]:
     if kg_client is None or len(statements) == 0:
         return [KGSignals(offline_or_empty=True) for _ in statements]
 
     total = len(statements)
-    print(f"Fetching KG signals for {total} statements (concurrency={max_workers})...")
+    print(f"Fetching KG signals for {total} statements (concurrency={max_workers})...", flush=True)
 
     # Pre-fetch predicate metadata first (ranges and counts) for the distinct predicates
     unique_preds = {s.predicate for s in statements if _is_uri(s.predicate)}
@@ -133,8 +186,11 @@ def fetch_signals_batch(
     results: List[Optional[KGSignals]] = [None] * total
 
     def _worker(idx: int, stmt: FactStatement) -> tuple[int, KGSignals]:
+        time.sleep(0.01)
         try:
-            sig = kg_client.get_triple_signals(stmt.subject, stmt.predicate, stmt.object)
+            sig = kg_client.get_triple_signals(
+                stmt.subject, stmt.predicate, stmt.object, refresh=refresh
+            )
         except Exception:
             sig = KGSignals(offline_or_empty=True)
         return idx, sig
@@ -147,7 +203,7 @@ def fetch_signals_batch(
             results[idx] = sig
             completed += 1
             if completed % 25 == 0 or completed == total:
-                print(f"  [KG signals] {completed}/{total} ({completed / total * 100:.1f}%) processed")
+                print(f"  [KG signals] {completed}/{total} ({completed / total * 100:.1f}%) processed", flush=True)
 
     return [sig if sig is not None else KGSignals(offline_or_empty=True) for sig in results]
 

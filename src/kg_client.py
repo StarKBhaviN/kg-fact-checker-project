@@ -17,11 +17,17 @@ from urllib.request import Request, urlopen
 DEFAULT_ENDPOINT = "https://dbpedia.org/sparql"
 DEFAULT_USER_AGENT = "kg-fact-checker/1.0 (FactBench-GERBIL)"
 
-
 @dataclass
 class KGSignals:
     direct_match: bool = False
+    property_match: bool = False
+    redirect_match: bool = False
     inverse_match: bool = False
+    has_target_relation: bool = False
+    has_conflicting_relation: bool = False
+    has_other_relation: bool = False
+    fwd_rel_count: int = 0
+    rev_rel_count: int = 0
     subject_out_degree: int = 0
     subject_in_degree: int = 0
     object_in_degree: int = 0
@@ -34,6 +40,61 @@ class KGSignals:
     object_has_types: bool = False
     type_compatible: bool = False
     offline_or_empty: bool = True
+
+
+ALIAS_MAP: Dict[str, Set[str]] = {
+    "director": {"director", "directing"},
+    "producer": {"producer", "producers", "executiveproducer"},
+    "productioncompany": {
+        "productioncompany",
+        "productioncompanies",
+        "studio",
+        "production",
+    },
+    "starring": {"starring", "cast", "actor", "actors", "star"},
+    "birthplace": {"birthplace", "birth", "born"},
+    "deathplace": {"deathplace", "death", "died", "restingplace"},
+    "city": {"city", "location", "headquarter", "headquarters", "campus"},
+    "affiliation": {"affiliation", "affiliations", "association", "member"},
+    "academicdiscipline": {
+        "academicdiscipline",
+        "discipline",
+        "field",
+        "fields",
+    },
+    "award": {
+        "award",
+        "awards",
+        "honour",
+        "honours",
+        "prize",
+        "recipient",
+        "winner",
+    },
+    "chancellor": {"chancellor", "chancellors", "president", "rector"},
+}
+
+CONFLICT_MAP: Dict[str, Set[str]] = {
+    "deathplace": {"birthplace", "birth"},
+    "birthplace": {"deathplace", "death"},
+    "director": {
+        "writer",
+        "starring",
+        "producer",
+        "editor",
+        "cinematography",
+        "musiccomposer",
+    },
+    "producer": {"director", "writer", "starring", "editor"},
+    "starring": {
+        "director",
+        "producer",
+        "writer",
+        "composer",
+        "musiccomposer",
+    },
+    "productioncompany": {"distributor", "distributors", "starring", "director", "writer"},
+}
 
 
 class SPARQLCache:
@@ -89,8 +150,8 @@ class DBpediaClient:
         endpoint: str = DEFAULT_ENDPOINT,
         cache_dir: str | Path = "cache",
         timeout: float = 6.0,
-        max_retries: int = 1,
-        backoff_base: float = 0.5,
+        max_retries: int = 3,
+        backoff_base: float = 1.0,
     ) -> None:
         self.endpoint = endpoint
         self.cache = SPARQLCache(Path(cache_dir) / "sparql_cache.sqlite")
@@ -133,11 +194,14 @@ class DBpediaClient:
                         self.cache.put(self.endpoint, sparql, data)
                         return data
             except HTTPError as exc:
-                if exc.code == 429 and attempt < self.max_retries:
+                if exc.code in (429, 503) and attempt < self.max_retries:
                     time.sleep(self.backoff_base * (2**attempt))
                     continue
                 break
             except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base * (1.5**attempt))
+                    continue
                 break
         return None
 
@@ -236,46 +300,123 @@ class DBpediaClient:
         self.cache.put(self.endpoint, k, {"types": types})
         return set(types)
 
-    def get_triple_signals(self, subject: str, predicate: str, obj: str) -> KGSignals:
-        """Assemble cached KG signals for a candidate (subject, predicate, object) triple."""
-        key = f"signals::{subject}||{predicate}||{obj}"
-        cached = self.cache.get(self.endpoint, key)
+    def get_canonical_uri(self, uri: str) -> str:
+        if not self._is_uri(uri):
+            return uri
+        k = f"canonical::{uri}"
+        cached = self.cache.get(self.endpoint, k)
         if cached is not None:
-            return KGSignals(**cached)
+            return cached.get("canonical", uri)
+        u_t = self._term(uri)
+        r = self.query_json(
+            f"SELECT ?target WHERE {{ {u_t} <http://dbpedia.org/ontology/wikiPageRedirects> ?target . }} LIMIT 1",
+            timeout=3.0,
+        )
+        canonical = uri
+        if r:
+            bindings = r.get("results", {}).get("bindings", [])
+            if bindings and "target" in bindings[0]:
+                canonical = bindings[0]["target"]["value"]
+        self.cache.put(self.endpoint, k, {"canonical": canonical})
+        return canonical
+
+    def get_triple_signals(
+        self, subject: str, predicate: str, obj: str, refresh: bool = False
+    ) -> KGSignals:
+        """Assemble cached KG signals for a candidate (subject, predicate, object) triple."""
+        key = f"signals_v3::{subject}||{predicate}||{obj}"
+        cached = self.cache.get(self.endpoint, key)
+        if cached is not None and not refresh:
+            valid_kwargs = {k: v for k, v in cached.items() if k in KGSignals.__dataclass_fields__}
+            return KGSignals(**valid_kwargs)
 
         s_uri = self._is_uri(subject)
         o_uri = self._is_uri(obj)
         p_uri = self._is_uri(predicate)
-        s_t = self._term(subject)
-        p_t = self._term(predicate)
-        o_t = self._term(obj)
+        pred_name = predicate.split("/")[-1].lower() if p_uri else ""
         responded = False
 
-        # 1. Direct match ASK
-        r_dir = self.query_json(f"ASK WHERE {{ {s_t} {p_t} {o_t} . }}", timeout=5.0)
-        responded = responded or (r_dir is not None)
-        direct_match = self._ask_val(r_dir)
+        s_can = self.get_canonical_uri(subject) if s_uri else subject
+        o_can = self.get_canonical_uri(obj) if o_uri else obj
 
-        # 2. Inverse match ASK
-        inverse_match = False
+        fwd_names: Set[str] = set()
+        rev_names: Set[str] = set()
+
         if s_uri and o_uri:
-            r_inv = self.query_json(f"ASK WHERE {{ {o_t} {p_t} {s_t} . }}", timeout=5.0)
-            responded = responded or (r_inv is not None)
-            inverse_match = self._ask_val(r_inv)
+            s_t = self._term(s_can)
+            o_t = self._term(o_can)
+            q_rel = f"""
+            SELECT DISTINCT ?p_fwd ?p_rev WHERE {{
+              {{ {s_t} ?p_fwd {o_t} . FILTER(?p_fwd != <http://dbpedia.org/ontology/wikiPageWikiLink>) }}
+              UNION
+              {{ {o_t} ?p_rev {s_t} . FILTER(?p_rev != <http://dbpedia.org/ontology/wikiPageWikiLink>) }}
+            }} LIMIT 30
+            """
+            r_rel = self.query_json(q_rel, timeout=5.0)
+            if r_rel is not None:
+                responded = True
+                bindings = r_rel.get("results", {}).get("bindings", [])
+                for b in bindings:
+                    if "p_fwd" in b:
+                        fwd_names.add(b["p_fwd"]["value"].split("/")[-1].lower())
+                    if "p_rev" in b:
+                        rev_names.add(b["p_rev"]["value"].split("/")[-1].lower())
 
-        # 3. Entity degrees & Predicate counts (cached by entity / predicate)
-        subj_out, subj_in = self.get_entity_degrees(subject) if s_uri else (0, 0)
-        obj_in, obj_out = self.get_entity_degrees(obj) if o_uri else (0, 0)
+            if not fwd_names and not rev_names and (s_can != subject or o_can != obj):
+                s_orig_t = self._term(subject)
+                o_orig_t = self._term(obj)
+                q_orig = f"""
+                SELECT DISTINCT ?p_fwd ?p_rev WHERE {{
+                  {{ {s_orig_t} ?p_fwd {o_orig_t} . FILTER(?p_fwd != <http://dbpedia.org/ontology/wikiPageWikiLink>) }}
+                  UNION
+                  {{ {o_orig_t} ?p_rev {s_orig_t} . FILTER(?p_rev != <http://dbpedia.org/ontology/wikiPageWikiLink>) }}
+                }} LIMIT 30
+                """
+                r_orig = self.query_json(q_orig, timeout=5.0)
+                if r_orig is not None:
+                    responded = True
+                    for b in r_orig.get("results", {}).get("bindings", []):
+                        if "p_fwd" in b:
+                            fwd_names.add(b["p_fwd"]["value"].split("/")[-1].lower())
+                        if "p_rev" in b:
+                            rev_names.add(b["p_rev"]["value"].split("/")[-1].lower())
+
+        all_rel_names = fwd_names | rev_names
+        targets = ALIAS_MAP.get(pred_name, {pred_name})
+        has_target_rel = bool(all_rel_names & targets) or any(pred_name in n for n in all_rel_names)
+
+        conflicts = CONFLICT_MAP.get(pred_name, set())
+        has_conflicting = (
+            bool(all_rel_names & conflicts) and not has_target_rel
+        ) or (
+            pred_name in ["deathplace", "birthplace"]
+            and bool(all_rel_names & {"birthplace", "deathplace"} - targets)
+        )
+        has_other_rel = bool(all_rel_names) and not has_target_rel and not has_conflicting
+
+        direct_match = bool(fwd_names & {pred_name})
+        property_match = bool(fwd_names & targets)
+        redirect_match = has_target_rel and (s_can != subject or o_can != obj) and not direct_match
+        inverse_match = bool(rev_names & targets)
+
+        # Degrees & Predicate counts (only if needed)
+        subj_out = subj_in = obj_in = obj_out = 0
+        if not all_rel_names:
+            subj_out, subj_in = self.get_entity_degrees(s_can) if s_uri else (0, 0)
+            obj_in, obj_out = self.get_entity_degrees(o_can) if o_uri else (0, 0)
         pred_subj, pred_obj = self.get_predicate_counts(predicate) if p_uri else (0, 0)
 
-        # 4. Shared neighbors & 2-hop paths (only if not identical and both URIs)
+        # Shared neighbors & 2-hop paths: only queried if no direct relation was found
         shared = two_hops = 0
-        if s_uri and o_uri and subject != obj:
+        if not all_rel_names and s_uri and o_uri and subject != obj:
+            s_t = self._term(s_can)
+            p_t = self._term(predicate)
+            o_t = self._term(o_can)
             r_2h = self.query_json(
                 f"SELECT (COUNT(*) AS ?hops) WHERE {{ "
                 f"{{ {s_t} ?p1 ?mid . ?mid {p_t} {o_t} . }} "
                 f"UNION {{ {s_t} {p_t} ?mid . ?mid ?p2 {o_t} . }} }} LIMIT 50",
-                timeout=5.0,
+                timeout=2.0,
             )
             if r_2h is not None:
                 responded = True
@@ -285,16 +426,16 @@ class DBpediaClient:
                 f"SELECT (COUNT(DISTINCT ?mid) AS ?shared) WHERE {{ "
                 f"{{ {s_t} ?p1 ?mid . ?mid ?p2 {o_t} . }} "
                 f"UNION {{ {s_t} ?p3 ?mid . {o_t} ?p4 ?mid . }} }} LIMIT 50",
-                timeout=5.0,
+                timeout=2.0,
             )
             if r_sh is not None:
                 responded = True
                 shared = self._int_val(r_sh, "shared")
 
-        # 5. Types & Type compatibility (cached by entity / predicate)
-        s_types = self.get_entity_types(subject) if s_uri else set()
-        o_types = self.get_entity_types(obj) if o_uri else set()
-        expected_ranges = self.get_predicate_ranges(predicate) if p_uri else set()
+        # Types & Type compatibility (only if needed)
+        s_types = self.get_entity_types(s_can) if (s_uri and not all_rel_names) else set()
+        o_types = self.get_entity_types(o_can) if (o_uri and not all_rel_names) else set()
+        expected_ranges = self.get_predicate_ranges(predicate) if (p_uri and not all_rel_names) else set()
         type_compat = (
             bool(expected_ranges & o_types)
             if (expected_ranges and o_types)
@@ -303,7 +444,14 @@ class DBpediaClient:
 
         signals = KGSignals(
             direct_match=direct_match,
+            property_match=property_match,
+            redirect_match=redirect_match,
             inverse_match=inverse_match,
+            has_target_relation=has_target_rel,
+            has_conflicting_relation=has_conflicting,
+            has_other_relation=has_other_rel,
+            fwd_rel_count=len(fwd_names),
+            rev_rel_count=len(rev_names),
             subject_out_degree=subj_out,
             subject_in_degree=subj_in,
             object_in_degree=obj_in,
@@ -315,7 +463,15 @@ class DBpediaClient:
             subject_has_types=bool(s_types),
             object_has_types=bool(o_types),
             type_compatible=type_compat,
-            offline_or_empty=not (responded or direct_match or inverse_match or subj_out > 0 or obj_in > 0),
+            offline_or_empty=not (
+                responded
+                or direct_match
+                or property_match
+                or has_target_rel
+                or subj_out > 0
+                or obj_in > 0
+            ),
         )
-        self.cache.put(self.endpoint, key, signals.__dict__)
+        if responded:
+            self.cache.put(self.endpoint, key, signals.__dict__)
         return signals
